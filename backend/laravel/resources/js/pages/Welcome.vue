@@ -59,9 +59,10 @@ const dashboardUrl = computed(() => {
             </nav>
         </header>
         <div
-            class="flex w-full items-center justify-center opacity-100 transition-opacity duration-750 lg:grow starting:opacity-0 text-white"
+            class="w-full items-center justify-center opacity-100 transition-opacity duration-750 lg:grow starting:opacity-0 text-white"
         >
-        yesno.answer: {{ yesOrNo.answer }}
+        <p>yesno.answer: {{ yesOrNo.answer }}</p>
+        <p><img src="storage/cat.jpg" alt="cat" /></p>
         </div>
         <div class="hidden h-14.5 lg:block"></div>
     </div>
