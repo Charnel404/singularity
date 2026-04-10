@@ -1,0 +1,11 @@
+linux:
+  name: linux
+
+token:
+  name: token
+
+solana:
+  name: solana
+
+crypto:
+  name: crypto
