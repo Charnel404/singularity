@@ -1,0 +1,7 @@
+---
+layout: post
+title:  "Token"
+date:   2026-04-10 02:23:11 +0300
+tags: token crypto solana
+---
+[pump.fun](https://pump.fun/coin/E67WWiQY4s9SZbCyFVTh2CEjorEYbhuVJQUZb3Mbpump)
