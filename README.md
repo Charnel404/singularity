@@ -1,8 +1,8 @@
 # Cyberia
-Website/blog: https://cyberia-temple.github.io
-X/Twitter: https://x.com/cyberia_chain
-Telegram channel: https://t.me/cyberia_network
-Telegram chat: https://t.me/cyberia_network_chat
+- Website/blog: https://cyberia-temple.github.io
+- X/Twitter: https://x.com/cyberia_chain
+- Telegram channel: https://t.me/cyberia_network
+- Telegram chat: https://t.me/cyberia_network_chat
 
 # Singularity
 
