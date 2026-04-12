@@ -1,23 +1,34 @@
 import os
+import re
+import sys
+import asyncio
 import logging
-from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from pathlib import Path
+
+from dotenv import load_dotenv
+from twikit import Client as TwikitClient
+from web3 import Web3
 from sqlalchemy import create_engine, text
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
+load_dotenv(Path(__file__).parent / ".env")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN not set")
+# --- Config ---
 
+X_USERNAME = os.environ.get("X_USERNAME")
+X_EMAIL = os.environ.get("X_EMAIL")
+X_PASSWORD = os.environ.get("X_PASSWORD")
+if not all([X_USERNAME, X_EMAIL, X_PASSWORD]):
+    raise ValueError("X_USERNAME, X_EMAIL, X_PASSWORD must be set in .env")
+
+DEPLOYER_PK = os.environ.get("DEPLOYER_PK")
+if not DEPLOYER_PK:
+    raise ValueError("DEPLOYER_PK not set")
+
+HTTP_PROXY = os.environ.get("HTTP_PROXY")
+X_MONITOR_ACCOUNT = os.environ.get("X_MONITOR_ACCOUNT", "cyberia_chain")
 DB_PATH = os.environ.get("DB_PATH", "/home/lain/random/singularity/backend/laravel/database/database.sqlite")
 
-TWITTER_USERNAME = os.environ.get("TWITTER_USERNAME", "your_twitter_username")
 X_TOKEN_ADDRESS = "0x14207CfF0880067B676B38cd17Ba7B002eeE8672"
-
 TOKEN_ABI = [
     {"inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}], "name": "mint", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
     {"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
@@ -25,60 +36,188 @@ TOKEN_ABI = [
 
 RPC_URL = "http://195.166.164.94:8545"
 CHAIN_ID = 49406
+MINT_AMOUNT = Web3.to_wei(1, "ether")
+POLL_INTERVAL = 120  # seconds
+
+COOKIES_FILE = Path(__file__).parent / "x_cookies.json"
+
+# --- Logging ---
+
+LOG_FILE = Path(__file__).parent / "x_bot.log"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
 
 logger = logging.getLogger(__name__)
+
+# --- DB ---
+
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 
+with engine.connect() as conn:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS x_airdrop_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tweet_id TEXT UNIQUE NOT NULL,
+            x_user_id TEXT NOT NULL,
+            x_username TEXT NOT NULL,
+            wallet_address TEXT NOT NULL,
+            tx_hash TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    conn.commit()
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Hi! To receive X tokens, tweet this:\n\n"
-        f"@{TWITTER_USERNAME} $X @your_telegram_username 0xaddress\n\n"
-        f"Then I'll verify your follow and mint 1 X per hour!"
-    )
+logger.info("Database ready")
+
+# --- Web3 ---
+
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
+account = w3.eth.account.from_key(DEPLOYER_PK)
+contract = w3.eth.contract(address=Web3.to_checksum_address(X_TOKEN_ADDRESS), abi=TOKEN_ABI)
+
+logger.info(f"Deployer: {account.address}")
+
+# --- Helpers ---
+
+ETH_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Commands:\n"
-        "/start - start receiving X\n"
-        "/check - verify tweet and get X\n"
-        "/balance - check X balance"
-    )
-
-
-async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    from web3 import Web3
-
-    w3 = Web3(Web3.HTTPProvider(RPC_URL))
-    contract = w3.eth.contract(address=Web3.to_checksum_address(X_TOKEN_ADDRESS), abi=TOKEN_ABI)
-
+def is_tweet_claimed(tweet_id: str) -> bool:
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT address FROM tg_wallets WHERE user_id = :user_id"), {"user_id": user_id}).fetchone()
+        result = conn.execute(
+            text("SELECT 1 FROM x_airdrop_claims WHERE tweet_id = :tid"),
+            {"tid": tweet_id},
+        ).fetchone()
+    return result is not None
 
-    if result:
-        address = result[0]
-        balance = contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
-        await update.message.reply_text(f"Balance {address[:6]}...{address[-4:]}: {balance // 10**18} X")
+
+def has_user_claimed_with_different_wallet(x_user_id: str, wallet: str) -> bool:
+    """Returns True if user already claimed with a DIFFERENT wallet."""
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT wallet_address FROM x_airdrop_claims WHERE x_user_id = :uid LIMIT 1"),
+            {"uid": x_user_id},
+        ).fetchone()
+    if result is None:
+        return False
+    return result[0].lower() != wallet.lower()
+
+
+def save_claim(tweet_id: str, x_user_id: str, x_username: str, wallet: str, tx_hash: str):
+    with engine.connect() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO x_airdrop_claims (tweet_id, x_user_id, x_username, wallet_address, tx_hash)
+                VALUES (:tid, :uid, :xuser, :wallet, :tx_hash)
+            """),
+            {"tid": tweet_id, "uid": x_user_id, "xuser": x_username, "wallet": wallet, "tx_hash": tx_hash},
+        )
+        conn.commit()
+
+
+def mint_token(to_address: str) -> str:
+    to = Web3.to_checksum_address(to_address)
+    nonce = w3.eth.get_transaction_count(account.address)
+
+    tx = contract.functions.mint(to, MINT_AMOUNT).build_transaction({
+        "chainId": CHAIN_ID,
+        "from": account.address,
+        "nonce": nonce,
+        "gas": 100_000,
+        "gasPrice": w3.eth.gas_price,
+    })
+
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+
+    return tx_hash.hex()
+
+
+# --- Main loop ---
+
+async def run():
+    # Login to X
+    if HTTP_PROXY:
+        logger.info(f"Using proxy: {HTTP_PROXY}")
+    client = TwikitClient("en-US", proxy=HTTP_PROXY)
+
+    if COOKIES_FILE.exists():
+        import json
+        with open(COOKIES_FILE) as f:
+            raw = json.load(f)
+        # Convert browser export format (array of objects) to twikit format (dict)
+        if isinstance(raw, list):
+            cookies = {c["name"]: c["value"] for c in raw if "name" in c and "value" in c}
+            client.set_cookies(cookies)
+        else:
+            client.load_cookies(str(COOKIES_FILE))
+        logger.info("Loaded cookies from file")
     else:
-        await update.message.reply_text("No wallet found. Use /set_wallet in the TG bot.")
+        logger.info(f"Logging in as @{X_USERNAME}...")
+        await client.login(
+            auth_info_1=X_USERNAME,
+            auth_info_2=X_EMAIL,
+            password=X_PASSWORD,
+            cookies_file=str(COOKIES_FILE),
+        )
+        logger.info("Logged in, cookies saved")
 
+    logger.info(f"Polling for mentions of @{X_MONITOR_ACCOUNT} every {POLL_INTERVAL}s")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Error: {context.error}")
+    while True:
+        try:
+            tweets = await client.search_tweet(f"@{X_MONITOR_ACCOUNT}", "Latest", count=20)
+            logger.info(f"Found {len(tweets)} tweets")
 
+            for tweet in tweets:
+                tweet_id = tweet.id
+                user = tweet.user
+                x_user_id = user.id
+                x_username = user.screen_name
+                tweet_text = tweet.text or ""
 
-def run_bot():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("check", check_command))
-    application.add_handler(CommandHandler("balance", check_command))
-    application.add_error_handler(error_handler)
-    logger.info("X Bot started")
-    application.run_polling(allowed_updates=["message"])
+                if is_tweet_claimed(tweet_id):
+                    continue
+
+                # Extract wallet
+                match = ETH_ADDRESS_RE.search(tweet_text)
+                if not match:
+                    logger.info(f"Tweet {tweet_id} by @{x_username}: no wallet, skipping")
+                    continue
+
+                wallet = match.group(0)
+                logger.info(f"Tweet {tweet_id} by @{x_username}: wallet {wallet}")
+
+                # One wallet per user
+                if has_user_claimed_with_different_wallet(x_user_id, wallet):
+                    logger.info(f"@{x_username} already claimed with different wallet, skipping")
+                    continue
+
+                # Mint
+                try:
+                    tx_hash = mint_token(wallet)
+                    save_claim(tweet_id, x_user_id, x_username, wallet, tx_hash)
+                    logger.info(f"Minted 1 X to {wallet} for @{x_username}, tx: {tx_hash}")
+                except Exception as e:
+                    logger.error(f"Mint failed for @{x_username} ({wallet}): {e}")
+
+            # Re-save cookies periodically
+            client.save_cookies(str(COOKIES_FILE))
+
+        except Exception as e:
+            logger.error(f"Error in poll loop: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    run_bot()
+    logger.info("X Airdrop Bot starting...")
+    asyncio.run(run())
