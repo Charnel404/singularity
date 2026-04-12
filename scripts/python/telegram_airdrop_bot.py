@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import logging
 from datetime import datetime, timedelta
@@ -48,22 +49,41 @@ TOKEN_ABI = [
 RPC_URL = "http://195.166.164.94:8545"
 CHAIN_ID = 49406
 
+LOG_FILE = Path(__file__).parent / "bot.log"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
+
 class SecurityFilter(logging.Filter):
     def filter(self, record):
-        record.msg = record.msg.replace(TELEGRAM_BOT_TOKEN, "***")
+        if TELEGRAM_BOT_TOKEN:
+            record.msg = record.msg.replace(TELEGRAM_BOT_TOKEN, "***")
         return True
+
+
 logger = logging.getLogger(__name__)
 logger.addFilter(SecurityFilter())
 
-engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+logger.info("Starting bot...")
+
+try:
+    engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    logger.info(f"Database connected: {DB_PATH}")
+except Exception as e:
+    logger.error(f"Database connection failed: {e}")
+    raise
 
 
 def is_valid_eth_address(address: str) -> bool:
@@ -101,66 +121,79 @@ async def set_wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Invalid address format. Expected 0x...")
         return
 
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT address FROM tg_wallets WHERE user_id = :user_id"),
-            {"user_id": user_id},
-        ).fetchone()
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT address FROM tg_wallets WHERE user_id = :user_id"),
+                {"user_id": user_id},
+            ).fetchone()
 
-        if result:
-            conn.execute(
-                text("UPDATE tg_wallets SET address = :address WHERE user_id = :user_id"),
-                {"address": address, "user_id": user_id},
-            )
-            msg = f"Address updated: {address}"
-        else:
-            conn.execute(
-                text("INSERT INTO tg_wallets (user_id, address) VALUES (:user_id, :address)"),
-                {"user_id": user_id, "address": address},
-            )
-            msg = f"Address saved: {address}. You'll receive 1 TG every hour!"
+            if result:
+                conn.execute(
+                    text("UPDATE tg_wallets SET address = :address WHERE user_id = :user_id"),
+                    {"address": address, "user_id": user_id},
+                )
+                msg = f"Address updated: {address}"
+            else:
+                conn.execute(
+                    text("INSERT INTO tg_wallets (user_id, address) VALUES (:user_id, :address)"),
+                    {"user_id": user_id, "address": address},
+                )
+                msg = f"Address saved: {address}. You'll receive 1 TG every hour!"
 
-        conn.commit()
+            conn.commit()
 
-    await update.message.reply_text(msg)
+        await update.message.reply_text(msg)
+    except Exception as e:
+        logger.error(f"Error in set_wallet: {e}")
+        await update.message.reply_text("Error saving address. Try again.")
 
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    with engine.connect() as conn:
-        conn.execute(
-            text("DELETE FROM tg_wallets WHERE user_id = :user_id"),
-            {"user_id": user_id},
-        )
-        conn.commit()
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("DELETE FROM tg_wallets WHERE user_id = :user_id"),
+                {"user_id": user_id},
+            )
+            conn.commit()
 
-    await update.message.reply_text("You have been removed from the airdrop list.")
+        await update.message.reply_text("You have been removed from the airdrop list.")
+    except Exception as e:
+        logger.error(f"Error in stop: {e}")
+        await update.message.reply_text("Error removing you from list.")
 
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from web3 import Web3
 
-    w3 = Web3(Web3.HTTPProvider(RPC_URL))
-    contract = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_ADDRESS), abi=TOKEN_ABI)
-
     user_id = update.effective_user.id
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT address FROM tg_wallets WHERE user_id = :user_id"),
-            {"user_id": user_id},
-        ).fetchone()
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT address FROM tg_wallets WHERE user_id = :user_id"),
+                {"user_id": user_id},
+            ).fetchone()
 
-    if not result:
-        await update.message.reply_text("You are not registered. Use /set_wallet <address>.")
-        return
+        if not result:
+            await update.message.reply_text("You are not registered. Use /set_wallet <address>.")
+            return
 
-    address = result[0]
-    balance = contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
-    decimals = 18
-    balance_tg = balance / (10**decimals)
+        address = result[0]
 
-    await update.message.reply_text(f"Balance {address[:6]}...{address[-4:]}: {balance_tg} TG")
+        w3 = Web3(Web3.HTTPProvider(RPC_URL))
+        contract = w3.eth.contract(address=Web3.to_checksum_address(TOKEN_ADDRESS), abi=TOKEN_ABI)
+
+        balance = contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
+        decimals = 18
+        balance_tg = balance / (10**decimals)
+
+        await update.message.reply_text(f"Balance {address[:6]}...{address[-4:]}: {balance_tg} TG")
+    except Exception as e:
+        logger.error(f"Error in balance: {e}")
+        await update.message.reply_text("Error fetching balance. Try again later.")
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,11 +201,14 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def run_dispatcher():
+    logger.info("Building application...")
+
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
 
     if HTTP_PROXY:
         proxy_url = HTTP_PROXY
         if proxy_url.startswith("http://") or proxy_url.startswith("socks5://"):
+            logger.info(f"Using proxy: {proxy_url}")
             builder = builder.request(
                 HTTPXRequest(
                     connection_pool_size=10,
@@ -193,8 +229,14 @@ def run_dispatcher():
     application.add_error_handler(error_handler)
 
     logger.info("Bot started, polling...")
-    application.run_polling(allowed_updates=["message"])
+
+    try:
+        application.run_polling(allowed_updates=["message"])
+    except Exception as e:
+        logger.error(f"Polling error: {e}")
+        raise
 
 
 if __name__ == "__main__":
+    logger.info("Main entry point")
     run_dispatcher()
